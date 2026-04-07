@@ -34,6 +34,17 @@ export type StreamFn = (
  */
 export type ToolExecutionMode = "sequential" | "parallel";
 
+/**
+ * Configuration for how assistant responses are streamed.
+ *
+ * - "per-response": Wait for the complete LLM response, then execute all tool calls.
+ *   This is the default behavior and ensures tools see the complete assistant message.
+ * - "per-block": Execute tool calls as each tool_call block completes during streaming.
+ *   This allows tool execution to overlap with streaming for faster response times.
+ *   Note: The assistant message won't have all tool calls until the response is complete.
+ */
+export type StreamingMode = "per-response" | "per-block";
+
 /** A single tool call content block emitted by an assistant message. */
 export type AgentToolCall = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 
@@ -192,6 +203,26 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	toolExecution?: ToolExecutionMode;
 
 	/**
+	 * Streaming mode for assistant responses.
+	 * - "per-response": Wait for the complete LLM response, then execute all tool calls.
+	 *   This ensures tools see the complete assistant message before execution.
+	 * - "per-block": Execute tool calls as each tool_call block completes during streaming.
+	 *   This allows tool execution to overlap with streaming for faster response times.
+	 *
+	 * Default: "per-response"
+	 *
+	 * @example
+	 * ```typescript
+	 * // Faster: tools execute as soon as they're ready
+	 * const agent = new Agent({
+	 *   streamingMode: "per-block",
+	 *   // ...
+	 * });
+	 * ```
+	 */
+	streamingMode?: StreamingMode;
+
+	/**
 	 * Called before a tool is executed, after arguments have been validated.
 	 *
 	 * Return `{ block: true }` to prevent execution. The loop emits an error tool result instead.
@@ -338,4 +369,9 @@ export type AgentEvent =
 	// Tool execution lifecycle
 	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
 	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
-	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean };
+	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean }
+	// Per-block streaming events (emitted when streamingMode is "per-block")
+	/** Emitted when a content block completes during streaming (text, thinking, or toolcall). */
+	| { type: "block_complete"; blockType: "text" | "thinking" | "toolcall"; blockIndex: number; message: AgentMessage }
+	/** Emitted when a tool result is available during streaming (streamingMode: "per-block"). */
+	| { type: "streaming_tool_result"; toolResult: ToolResultMessage; message: AgentMessage };
