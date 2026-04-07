@@ -21,6 +21,7 @@ import type {
 	BeforeToolCallContext,
 	BeforeToolCallResult,
 	StreamFn,
+	StreamingMode,
 	ToolExecutionMode,
 } from "./types.js";
 
@@ -107,6 +108,24 @@ export interface AgentOptions {
 	transport?: Transport;
 	maxRetryDelayMs?: number;
 	toolExecution?: ToolExecutionMode;
+	/**
+	 * Streaming mode for assistant responses.
+	 * - "per-response" (default): Wait for the complete LLM response, then execute all tool calls.
+	 *   This ensures tools see the complete assistant message before execution.
+	 * - "per-block": Execute tool calls as each tool_call block completes during streaming.
+	 *   This allows tool execution to overlap with streaming for faster response times.
+	 *
+	 * Default: "per-response"
+	 *
+	 * @example
+	 * ```typescript
+	 * const agent = new Agent({
+	 *   streamingMode: "per-block",
+	 *   // ...
+	 * });
+	 * ```
+	 */
+	streamingMode?: StreamingMode;
 }
 
 class PendingMessageQueue {
@@ -184,6 +203,14 @@ export class Agent {
 	public maxRetryDelayMs?: number;
 	/** Tool execution strategy for assistant messages that contain multiple tool calls. */
 	public toolExecution: ToolExecutionMode;
+	/**
+	 * Streaming mode for assistant responses.
+	 * - "per-response" (default): Wait for the complete LLM response, then execute all tool calls.
+	 * - "per-block": Execute tool calls as each tool_call block completes during streaming.
+	 *
+	 * Use "per-block" for faster response times when using tools.
+	 */
+	public streamingMode: StreamingMode;
 
 	constructor(options: AgentOptions = {}) {
 		this._state = createMutableAgentState(options.initialState);
@@ -201,6 +228,7 @@ export class Agent {
 		this.transport = options.transport ?? "sse";
 		this.maxRetryDelayMs = options.maxRetryDelayMs;
 		this.toolExecution = options.toolExecution ?? "parallel";
+		this.streamingMode = options.streamingMode ?? "per-response";
 	}
 
 	/**
@@ -415,6 +443,7 @@ export class Agent {
 			thinkingBudgets: this.thinkingBudgets,
 			maxRetryDelayMs: this.maxRetryDelayMs,
 			toolExecution: this.toolExecution,
+			streamingMode: this.streamingMode,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
 			convertToLlm: this.convertToLlm,
