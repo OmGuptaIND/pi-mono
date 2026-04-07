@@ -8,6 +8,7 @@ import {
 	type Context,
 	EventStream,
 	streamSimple,
+	type ToolCall,
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@mariozechner/pi-ai";
@@ -20,6 +21,7 @@ import type {
 	AgentToolCall,
 	AgentToolResult,
 	StreamFn,
+	StreamingMode,
 } from "./types.js";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
@@ -187,31 +189,65 @@ async function runLoop(
 				pendingMessages = [];
 			}
 
-			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+			// Determine streaming mode
+			const streamingMode: StreamingMode = config.streamingMode ?? "per-response";
+
+			// Stream assistant response based on mode
+			const result =
+				streamingMode === "per-block"
+					? await streamAssistantResponsePerBlock(currentContext, config, signal, emit, streamFn)
+					: await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+
+			const message = result.message;
+			const streamingToolResults = result.toolResults;
+
+			// Add the assistant message to newMessages
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				await emit({ type: "turn_end", message, toolResults: [] });
+				await emit({ type: "turn_end", message, toolResults: streamingToolResults });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
 
-			// Check for tool calls
+			// Check for tool calls in the complete message
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
 			hasMoreToolCalls = toolCalls.length > 0;
 
-			const toolResults: ToolResultMessage[] = [];
-			if (hasMoreToolCalls) {
-				toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit)));
+			// Collect all tool results (from streaming + any remaining)
+			const allToolResults: ToolResultMessage[] = [...streamingToolResults];
 
-				for (const result of toolResults) {
-					currentContext.messages.push(result);
-					newMessages.push(result);
+			// Execute any tool calls that weren't executed during streaming
+			if (hasMoreToolCalls) {
+				const remainingToolCalls = toolCalls.filter(
+					(tc) => !streamingToolResults.some((tr) => tr.toolCallId === tc.id),
+				);
+
+				if (remainingToolCalls.length > 0) {
+					// Build a partial assistant message for the remaining tool calls
+					const partialMessageForExecution: AssistantMessage = {
+						...message,
+						content: remainingToolCalls,
+					};
+
+					const remainingResults = await executeToolCalls(
+						currentContext,
+						partialMessageForExecution,
+						config,
+						signal,
+						emit,
+					);
+					allToolResults.push(...remainingResults);
 				}
 			}
 
-			await emit({ type: "turn_end", message, toolResults });
+			// Add all tool results to context
+			for (const result of allToolResults) {
+				currentContext.messages.push(result);
+				newMessages.push(result);
+			}
+
+			await emit({ type: "turn_end", message, toolResults: allToolResults });
 
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
 		}
@@ -234,6 +270,7 @@ async function runLoop(
 /**
  * Stream an assistant response from the LLM.
  * This is where AgentMessage[] gets transformed to Message[] for the LLM.
+ * Returns the complete message with all tool results.
  */
 async function streamAssistantResponse(
 	context: AgentContext,
@@ -241,7 +278,7 @@ async function streamAssistantResponse(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
-): Promise<AssistantMessage> {
+): Promise<{ message: AssistantMessage; toolResults: ToolResultMessage[] }> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
 	if (config.transformContext) {
@@ -314,7 +351,11 @@ async function streamAssistantResponse(
 					await emit({ type: "message_start", message: { ...finalMessage } });
 				}
 				await emit({ type: "message_end", message: finalMessage });
-				return finalMessage;
+
+				// Execute all tool calls after the complete response is received
+				const toolResults = await executeToolCalls(context, finalMessage, config, signal, emit);
+
+				return { message: finalMessage, toolResults };
 			}
 		}
 	}
@@ -327,7 +368,292 @@ async function streamAssistantResponse(
 		await emit({ type: "message_start", message: { ...finalMessage } });
 	}
 	await emit({ type: "message_end", message: finalMessage });
-	return finalMessage;
+
+	// Execute all tool calls after the complete response is received
+	const toolResults = await executeToolCalls(context, finalMessage, config, signal, emit);
+
+	return { message: finalMessage, toolResults };
+}
+
+/**
+ * Stream an assistant response from the LLM with per-block streaming.
+ *
+ * In this mode, tool calls are executed as soon as their tool_call block completes,
+ * allowing tool execution to overlap with the streaming of remaining content.
+ * This provides faster response times for multi-tool calls.
+ */
+async function streamAssistantResponsePerBlock(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	streamFn?: StreamFn,
+): Promise<{ message: AssistantMessage; toolResults: ToolResultMessage[] }> {
+	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
+	let messages = context.messages;
+	if (config.transformContext) {
+		messages = await config.transformContext(messages, signal);
+	}
+
+	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
+	const llmMessages = await config.convertToLlm(messages);
+
+	// Build LLM context
+	const llmContext: Context = {
+		systemPrompt: context.systemPrompt,
+		messages: llmMessages,
+		tools: context.tools,
+	};
+
+	const streamFunction = streamFn || streamSimple;
+
+	// Resolve API key (important for expiring tokens)
+	const resolvedApiKey =
+		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+
+	const response = await streamFunction(config.model, llmContext, {
+		...config,
+		apiKey: resolvedApiKey,
+		signal,
+	});
+
+	let partialMessage: AssistantMessage | null = null;
+	let addedPartial = false;
+	const completedToolResults: ToolResultMessage[] = [];
+	const pendingToolExecutions: Map<number, { toolCall: ToolCall; execution: Promise<ToolResultMessage> }> = new Map();
+
+	for await (const event of response) {
+		switch (event.type) {
+			case "start":
+				partialMessage = event.partial;
+				context.messages.push(partialMessage);
+				addedPartial = true;
+				await emit({ type: "message_start", message: { ...partialMessage } });
+				break;
+
+			case "text_start": {
+				if (partialMessage) {
+					partialMessage = event.partial;
+					context.messages[context.messages.length - 1] = partialMessage;
+					await emit({
+						type: "message_update",
+						assistantMessageEvent: event,
+						message: { ...partialMessage },
+					});
+				}
+				break;
+			}
+
+			case "text_delta": {
+				if (partialMessage) {
+					partialMessage = event.partial;
+					context.messages[context.messages.length - 1] = partialMessage;
+					await emit({
+						type: "message_update",
+						assistantMessageEvent: event,
+						message: { ...partialMessage },
+					});
+				}
+				break;
+			}
+
+			case "text_end": {
+				if (partialMessage) {
+					// Emit block_complete for text
+					await emit({
+						type: "block_complete",
+						blockType: "text",
+						blockIndex: event.contentIndex,
+						message: { ...partialMessage },
+					});
+				}
+				break;
+			}
+
+			case "thinking_start": {
+				if (partialMessage) {
+					partialMessage = event.partial;
+					context.messages[context.messages.length - 1] = partialMessage;
+					await emit({
+						type: "message_update",
+						assistantMessageEvent: event,
+						message: { ...partialMessage },
+					});
+				}
+				break;
+			}
+
+			case "thinking_delta": {
+				if (partialMessage) {
+					partialMessage = event.partial;
+					context.messages[context.messages.length - 1] = partialMessage;
+					await emit({
+						type: "message_update",
+						assistantMessageEvent: event,
+						message: { ...partialMessage },
+					});
+				}
+				break;
+			}
+
+			case "thinking_end": {
+				if (partialMessage) {
+					// Emit block_complete for thinking
+					await emit({
+						type: "block_complete",
+						blockType: "thinking",
+						blockIndex: event.contentIndex,
+						message: { ...partialMessage },
+					});
+				}
+				break;
+			}
+
+			case "toolcall_start": {
+				if (partialMessage) {
+					partialMessage = event.partial;
+					context.messages[context.messages.length - 1] = partialMessage;
+					await emit({
+						type: "message_update",
+						assistantMessageEvent: event,
+						message: { ...partialMessage },
+					});
+				}
+				break;
+			}
+
+			case "toolcall_delta": {
+				if (partialMessage) {
+					partialMessage = event.partial;
+					context.messages[context.messages.length - 1] = partialMessage;
+					await emit({
+						type: "message_update",
+						assistantMessageEvent: event,
+						message: { ...partialMessage },
+					});
+				}
+				break;
+			}
+
+			case "toolcall_end": {
+				if (partialMessage && event.toolCall) {
+					// Immediately execute this tool call without waiting for the rest of the stream
+					const toolCall = event.toolCall;
+					const blockIndex = event.contentIndex;
+
+					// Emit block_complete for the toolcall block
+					await emit({
+						type: "block_complete",
+						blockType: "toolcall",
+						blockIndex,
+						message: { ...partialMessage },
+					});
+
+					// Start executing the tool call immediately
+					// We use the partial message at this point - it has the complete tool call
+					const execution = executeSingleToolCall(context, partialMessage, toolCall, config, signal, emit);
+					pendingToolExecutions.set(blockIndex, { toolCall, execution });
+				}
+				break;
+			}
+
+			case "done":
+			case "error": {
+				const finalMessage = await response.result();
+				if (addedPartial) {
+					context.messages[context.messages.length - 1] = finalMessage;
+				} else {
+					context.messages.push(finalMessage);
+				}
+				if (!addedPartial) {
+					await emit({ type: "message_start", message: { ...finalMessage } });
+				}
+				await emit({ type: "message_end", message: finalMessage });
+
+				// Wait for all pending tool executions to complete
+				const allResults: ToolResultMessage[] = [...completedToolResults];
+
+				// Wait for pending tool executions in order
+				const sortedPending = Array.from(pendingToolExecutions.entries()).sort((a, b) => a[0] - b[0]);
+				for (const [, { execution }] of sortedPending) {
+					const result = await execution;
+					// Avoid duplicates (in case a tool was already executed)
+					if (!allResults.some((r) => r.toolCallId === result.toolCallId)) {
+						allResults.push(result);
+					}
+				}
+
+				return { message: finalMessage, toolResults: allResults };
+			}
+		}
+	}
+
+	const finalMessage = await response.result();
+	if (addedPartial) {
+		context.messages[context.messages.length - 1] = finalMessage;
+	} else {
+		context.messages.push(finalMessage);
+		await emit({ type: "message_start", message: { ...finalMessage } });
+	}
+	await emit({ type: "message_end", message: finalMessage });
+
+	// Wait for all pending tool executions to complete
+	const allResults: ToolResultMessage[] = [...completedToolResults];
+
+	const sortedPending = Array.from(pendingToolExecutions.entries()).sort((a, b) => a[0] - b[0]);
+	for (const [, { execution }] of sortedPending) {
+		const result = await execution;
+		if (!allResults.some((r) => r.toolCallId === result.toolCallId)) {
+			allResults.push(result);
+		}
+	}
+
+	return { message: finalMessage, toolResults: allResults };
+}
+
+/**
+ * Execute a single tool call immediately.
+ * Used by per-block streaming to execute tools as soon as their block completes.
+ */
+async function executeSingleToolCall(
+	context: AgentContext,
+	assistantMessage: AssistantMessage,
+	toolCall: ToolCall,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+): Promise<ToolResultMessage> {
+	// Emit tool_execution_start
+	await emit({
+		type: "tool_execution_start",
+		toolCallId: toolCall.id,
+		toolName: toolCall.name,
+		args: toolCall.arguments,
+	});
+
+	// Prepare the tool call
+	const preparation = await prepareToolCall(context, assistantMessage, toolCall as AgentToolCall, config, signal);
+
+	if (preparation.kind === "immediate") {
+		// Tool was blocked or not found
+		const result = await emitToolCallOutcome(preparation.toolCall, preparation.result, preparation.isError, emit);
+		return result;
+	}
+
+	// Execute the tool
+	const executed = await executePreparedToolCall(preparation, signal, emit);
+
+	// Finalize and emit
+	const finalized = await finalizeExecutedToolCall(context, assistantMessage, preparation, executed, config, signal, emit);
+
+	// Emit streaming_tool_result event
+	await emit({
+		type: "streaming_tool_result",
+		toolResult: finalized,
+		message: { ...assistantMessage },
+	});
+
+	return finalized;
 }
 
 /**
@@ -446,6 +772,7 @@ type PreparedToolCall = {
 
 type ImmediateToolCallOutcome = {
 	kind: "immediate";
+	toolCall: AgentToolCall;
 	result: AgentToolResult<any>;
 	isError: boolean;
 };
@@ -480,6 +807,7 @@ async function prepareToolCall(
 	if (!tool) {
 		return {
 			kind: "immediate",
+			toolCall,
 			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
 			isError: true,
 		};
@@ -501,6 +829,7 @@ async function prepareToolCall(
 			if (beforeResult?.block) {
 				return {
 					kind: "immediate",
+					toolCall,
 					result: createErrorToolResult(beforeResult.reason || "Tool execution was blocked"),
 					isError: true,
 				};
@@ -515,6 +844,7 @@ async function prepareToolCall(
 	} catch (error) {
 		return {
 			kind: "immediate",
+			toolCall,
 			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
 			isError: true,
 		};
